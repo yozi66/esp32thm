@@ -3,20 +3,21 @@
 #include <analogWrite.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <SPI.h>
 #include <WiFi.h>
-#include <Wire.h>
+#include <time.h>
 
 #include "arduino_secrets.h"
-#include "time.h"
+#include "thingProperties.h"
+#include "AverageTemp.h"
 
-#define OLED_SDA 5
-#define OLED_SCL 4
 #define LED_BUILTIN 16
 // LED is OFF at HIGH level
 #define LED_OFF 255
-// the LED is too bright, 55/255 duty is enough
-#define LED_ON 200
+// the LED is too bright, 15/255 duty is enough
+#define LED_ON 240
+
+#define OLED_SDA 5
+#define OLED_SCL 4
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
@@ -27,52 +28,34 @@
 #define ONE_WIRE_BUS 14
 #define TEMPERATURE_PRECISION 12
 
+#define ARRAY_LENGTH 3
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
+DeviceAddress oneWire_addr[ARRAY_LENGTH];
 
-const char* wifi_ssid = SECRET_SSID;
-const char* wifi_pass = SECRET_PASS;
+// number of valid addresses
+int addr_count = 0;
 
-const char* ntpServer = "pool.ntp.org";
+// average temperatures
+AverageTemp avgTemp[ARRAY_LENGTH];
+
+CloudTemperatureSensor * sensors[] = { &t0, &t1, &t2 };
+
+// the current time
 const long  gmtOffset_sec = 3600;
 const int   daylightOffset_sec = 3600;
 
-// the current time
-struct tm timeinfo;
-bool valid_time;
+// local time
+struct tm * timeinfo;
 
 // last second displayed
 int lastsec;
 
-// thermometer
-DeviceAddress oneWire_addr;
-
-// last measured temperature
-float temp_curr;
-
-// exponential moving average temperature
-float temp_avg;
-
-// weight of the old value in exponential moving average
-const int old_wt = 7;
-
-// temperature on display
-float temp_disp;
-
-// display hysteresis in Celsius
-const float hysteresis = 0.05;
-
-// temperature change direction, true for increase and false for decrease
-boolean temp_inc;
-
-void blink() {
-    analogWrite(LED_BUILTIN, LED_ON);   // turn the LED on
-    delay(500);                       // wait for 1/2 second
-    analogWrite(LED_BUILTIN, LED_OFF);  // turn the LED off
-    delay(500);                      // wait for 1/2 second  
-}
+// last minute displayed
+int lastmin;
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
@@ -92,127 +75,112 @@ void setup() {
   display.setTextColor(SSD1306_WHITE, SSD1306_BLACK); // Draw white text and erase background to black
   display.setCursor(0, 24);    // Start at the fourth line of the display
   display.cp437(true);         // Use full 256 char 'Code Page 437' font
-  display.print("Connecting to ");
-  display.println(wifi_ssid);
-  display.display();
 
-  WiFi.begin(wifi_ssid, wifi_pass);
- 
-  while (WiFi.status() != WL_CONNECTED) {
-    blink();
-    Serial.println("Establishing connection to WiFi..");
-  }
- 
-  Serial.println("Connected to network");
-  analogWrite(LED_BUILTIN, LED_ON);
-  display.println("Connected");
-  display.println();
-  display.println("Getting time from ");
-  display.println(ntpServer);
-  display.display();
-  delay(250);
-
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  getLocalTime();
   printLocalTime();
-  if(!getLocalTime(&timeinfo)){
-    display.println("Failed to obtain time");
-    display.display();
-  }
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  delay(250);
 
   ds18b20.begin();
   display.clearDisplay();
   display.setCursor(0, 24);    // Start at the fourth line of the display
 
   display.print("Found ");
-  display.print(ds18b20.getDeviceCount(), DEC);
+  int deviceCount = ds18b20.getDeviceCount();
+  display.print(deviceCount, DEC);
   display.println(" sensor(s)");
-  ds18b20.getAddress(oneWire_addr, 0);
-  printAddress(oneWire_addr);
-  valid_time = getLocalTime(&timeinfo);
+  for (addr_count = 0; addr_count < ARRAY_LENGTH && addr_count < deviceCount; addr_count++) {
+    ds18b20.getAddress(oneWire_addr[addr_count], addr_count);
+    printAddress(oneWire_addr[addr_count]);
+  }
+  getLocalTime();
   printLocalTime();
+  delay(500);
+
   ds18b20.requestTemperatures();
   delay(750);
-  temp_avg = ds18b20.getTempC(oneWire_addr);
-  temp_disp = temp_avg;
-  printTemperature();
+  for (int i = 0; i < addr_count; i++) {
+    avgTemp[i].setTemp(ds18b20.getTempC(oneWire_addr[i]));
+  }
+  printTemperatures();
+  getLocalTime();
   printLocalTime();
+
+  // Defined in thingProperties.h
+  initProperties();
+
+  // Connect to Arduino IoT Cloud
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();  
+  Serial.print("update");
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-  valid_time = getLocalTime(&timeinfo);
-  if (!valid_time) {
-    delay(750);
-  }
-  if (!valid_time || timeinfo.tm_sec != lastsec) {
-    printTemperature();
-    printLocalTime();
+  getLocalTime();
+  if (timeinfo->tm_sec != lastsec) {
+    analogWrite(LED_BUILTIN, LED_ON);   // turn the LED on
+    Serial.print(".");
+    ArduinoCloud.update(); // does not work if called once a minute only
+    analogWrite(LED_BUILTIN, LED_OFF);   // turn the LED off
+  
+    printTemperatures();
+    if (timeinfo->tm_min != lastmin) {
+      Serial.print("done\n");
+      for (int i = 0; i < addr_count; i++) {
+          float value = avgTemp[i].getAvg();
+          *sensors[i] = value;
+          Serial.print("t");
+          Serial.print(i);
+          Serial.print("=");
+          Serial.print(value,3);
+          Serial.print("\n");
+      }
+      Serial.print("update");
+    }
+    printLocalTime(); // updates lastmin and lastsec
   }
 }
 
-void printTemperature() {
+void printTemperatures() {
   display.clearDisplay();
 
-  // current temperature
-  temp_curr = ds18b20.getTempC(oneWire_addr);
-  display.setCursor(0, 56);
-  display.print("Raw: ");
-  display.println(temp_curr, 4);
+  for (int i = 0; i < addr_count; i++) {
+    avgTemp[i].setTemp(ds18b20.getTempC(oneWire_addr[i]));
+    int y_base = (i + 1) * 16;
+    display.setCursor(0, y_base);
+    display.println(avgTemp[i].temp_curr, 2);
   
-  // average temperature
-  temp_avg = (temp_curr + old_wt * temp_avg) / (old_wt + 1); // compute moving average
-  /*
-  display.setCursor(0, 46);
-  display.print("Avg: ");
-  display.println(temp_avg, 6);
-  */
-
-  // temperature with hysteresis
-  bool update = false;
-  if (temp_inc) {
-    update = temp_avg > temp_disp;
-    if (!update && temp_avg < temp_disp - hysteresis) {
-      update = true;
-      temp_inc = false; 
-    }
-  } else {
-     update = temp_avg < temp_disp;
-     if (!update && temp_avg > temp_disp + hysteresis) {
-      update = true;
-      temp_inc = true;
-     }
+    display.setCursor(36, y_base);
+    display.setTextSize(2);
+    display.print(avgTemp[i].temp_disp, 1);
+    display.setTextSize(1);
+    display.print("\xF8" "C");
   }
-  if (update) {
-    temp_disp = temp_avg;
-  }
-  display.setCursor(20, 25);
-  display.setTextSize(3);
-  display.print(temp_disp, 1);
-  display.setTextSize(1);
-  display.print("\xF8" "C");
   ds18b20.requestTemperatures();
 }
+
+void getLocalTime() {
+  time_t gmt = time(NULL);
+  time_t local = gmt + gmtOffset_sec + daylightOffset_sec;
+  timeinfo = localtime(&local);
+}
+
 /* http://www.cplusplus.com/reference/ctime/strftime/ */
 void printLocalTime() {
-  if(valid_time){
+  if (timeinfo->tm_year > 100) {
     display.setCursor(4, 0);
-    display.print(&timeinfo, "%Y ");
-    display.setCursor(34, 1);
+    display.print(timeinfo, "%Y ");
+    display.setCursor(34, 0);
     display.setTextSize(2);
-    display.print(&timeinfo, "%R");
+    display.print(timeinfo, "%R");
     display.setTextSize(1);
-    display.print(&timeinfo, ":%S");
-    display.setCursor(0, 10);
-    display.print(&timeinfo, "%m-%d");
-    display.display();
-    lastsec = timeinfo.tm_sec;
-  } else {
-    display.setCursor(0, 0);     // Start at top-left corner
-    display.println("????-??-?? ??:??:??");
+    display.setCursor(0, 8);
+    display.print(timeinfo, "%m-%d");
   }
+  display.setCursor(94,0);
+  display.print(timeinfo, ":%S");
+  display.display();
+  lastsec = timeinfo->tm_sec;
+  lastmin = timeinfo->tm_min;
 }
 
 // function to print a device address
@@ -224,4 +192,5 @@ void printAddress(DeviceAddress deviceAddress) {
   }
   display.println();
   display.display();
+  delay(500);
 }

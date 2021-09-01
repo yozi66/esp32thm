@@ -1,2 +1,5 @@
 #define SECRET_SSID "your_wifi_ssid"
 #define SECRET_PASS "your_wifi_password"
+#define SECRET_DEVICE_KEY "your_key_to_arduino_iot_cloud"
+#define MY_THING_ID "the_id_of_your_thing"
+#define MY_DEVICE_LOGIN_NAME "the_login_name_of_your_device"
